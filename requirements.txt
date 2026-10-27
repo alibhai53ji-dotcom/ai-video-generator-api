@@ -1,3 +1,5 @@
+
 fastapi
 uvicorn
 huggingface_hub
+magic_hour
