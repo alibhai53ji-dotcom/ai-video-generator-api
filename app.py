@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from huggingface_hub import InferenceClient
+from magic_hour import Client
 
 app = FastAPI(title="AI Video Generator API")
 
@@ -18,7 +18,7 @@ jobs = {}
 
 class VideoRequest(BaseModel):
     prompt: str
-    duration: int = 8
+    duration: int = 5
     style: str = "3D animation"
 
 
@@ -34,67 +34,110 @@ def health():
 
 @app.post("/generate")
 def generate_video(request: VideoRequest):
-    if not os.environ.get("HF_TOKEN"):
+    api_key = os.environ.get("MAGIC_HOUR_API_KEY")
+
+    if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="HF_TOKEN is missing in Render settings"
+            detail="MAGIC_HOUR_API_KEY is missing"
+        )
+
+    if not request.prompt.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt cannot be empty"
         )
 
     job_id = str(uuid.uuid4())
-    output_file = VIDEO_DIR / f"{job_id}.mp4"
+    job_dir = VIDEO_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
 
     jobs[job_id] = {"status": "processing"}
 
     try:
-        client = InferenceClient(
-            provider="fal-ai",
-            api_key=os.environ["HF_TOKEN"],
-            timeout=600
+        client = Client(token=api_key)
+
+        result = client.v1.text_to_video.generate(
+            name=f"Video {job_id[:8]}",
+            end_seconds=5,
+            aspect_ratio="16:9",
+            style={
+                "prompt": f"{request.style}: {request.prompt}"
+            },
+            model="ltx-2.5",
+            resolution="480p",
+            wait_for_completion=True,
+            download_outputs=True,
+            download_directory=str(job_dir)
         )
 
-        prompt = f"{request.style}: {request.prompt}"
+        if result.status != "complete":
+            error = getattr(result, "error", None)
+            message = getattr(error, "message", "Generation failed")
+            jobs[job_id] = {
+                "status": "failed",
+                "message": str(message)
+            }
+            raise HTTPException(status_code=502, detail=str(message))
 
-        video_bytes = client.text_to_video(
-            prompt=prompt,
-            model="Wan-AI/Wan2.2-TI2V-5B"
-        )
+        files = list(job_dir.rglob("*.mp4"))
 
-        output_file.write_bytes(video_bytes)
+        if not files:
+            raise RuntimeError(
+                "Generation completed but no MP4 was downloaded"
+            )
+
+        video_path = files[0]
 
         jobs[job_id] = {
             "status": "completed",
-            "download_url": f"/video/{job_id}"
+            "download_url": f"/video/{job_id}",
+            "credits_charged": getattr(
+                result, "credits_charged", None
+            )
         }
 
         return {"job_id": job_id, **jobs[job_id]}
 
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception as exc:
         jobs[job_id] = {
             "status": "failed",
-            "message": str(e)[:1000]
+            "message": str(exc)[:500]
         }
-        raise HTTPException(status_code=502, detail=str(e)[:1000])
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc)[:500]
+        )
 
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
+
     return {"job_id": job_id, **jobs[job_id]}
 
 
 @app.get("/video/{job_id}")
 def download_video(job_id: str):
-    output_file = VIDEO_DIR / f"{job_id}.mp4"
-
-    if not output_file.exists():
+    if job_id not in jobs or jobs[job_id]["status"] != "completed":
         raise HTTPException(
             status_code=404,
-            detail="Video not found. Generate it first."
+            detail="Completed video not found"
+        )
+
+    files = list((VIDEO_DIR / job_id).rglob("*.mp4"))
+
+    if not files:
+        raise HTTPException(
+            status_code=404,
+            detail="Video file is no longer available"
         )
 
     return FileResponse(
-        path=output_file,
+        path=files[0],
         media_type="video/mp4",
         filename="generated_video.mp4"
     )
